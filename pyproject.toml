@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kindle-capture"
+version = "3.0.0"
+description = "Kindle page capture and searchable PDF builder for Windows and macOS"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Kindle Capture contributors" }]
+dependencies = [
+  "numpy>=1.26,<3",
+  "Pillow>=10.2,<13",
+  "pyobjc-framework-ApplicationServices>=10.2; sys_platform == 'darwin'",
+  "pyobjc-framework-Cocoa>=10.2; sys_platform == 'darwin'",
+  "pyobjc-framework-Quartz>=10.2; sys_platform == 'darwin'",
+  "pyobjc-framework-Vision>=10.2; sys_platform == 'darwin'",
+  "winrt-Windows.Foundation~=3.2.1.0; sys_platform == 'win32'",
+  "winrt-Windows.Foundation.Collections~=3.2.1.0; sys_platform == 'win32'",
+  "winrt-Windows.Globalization~=3.2.1.0; sys_platform == 'win32'",
+  "winrt-Windows.Graphics.Imaging~=3.2.1.0; sys_platform == 'win32'",
+  "winrt-Windows.Media.Ocr~=3.2.1.0; sys_platform == 'win32'",
+  "winrt-Windows.Storage.Streams~=3.2.1.0; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pypdf>=5,<7",
+  "pytest>=8,<9",
+  "PyInstaller>=6.10; sys_platform == 'darwin' or sys_platform == 'win32'",
+  "ruff>=0.8,<1",
+]
+
+[project.scripts]
+kindle-capture = "kindle_capture.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kindle_capture*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff.lint]
+ignore = ["BLE001"]
