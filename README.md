@@ -38,7 +38,7 @@ GUI、画像判定、JPEG/PDF生成、設定、ログは共通です。画面取
 
 ## ダウンロードするファイル
 
-初めて使う場合は、Pythonの設定が不要な「配布版」をおすすめします。GitHubのReleases、または「Actions > Build applications」のArtifactsから自分のOS用ZIPをダウンロードしてください。
+初めて使う場合は、Pythonの設定が不要な「配布版」をおすすめします。[最新のReleases](https://github.com/masoniana/kindle-capture/releases/latest)から自分のOS用ZIPをダウンロードしてください。開発途中の動作確認版は「Actions > Build applications」のArtifactsにもあります。
 
 配布ZIPには、この初期設定だけを抜き出した `FIRST_RUN.txt` も同梱されます。
 
@@ -202,7 +202,13 @@ macOS版はAd-hoc署名です。第三者へ一般配布する場合、Gatekeepe
 - `.github/workflows/ci.yml`: Windows/macOSで静的検査とテストを実行
 - `.github/workflows/build.yml`: 手動実行または `v*` タグでWindows x64、macOS Apple Silicon、macOS IntelのZIPを生成
 
-GitHubへpush後、「Actions > Build applications > Run workflow」で両OSの配布物を作れます。`v3.0.0` のようなタグをpushした場合も同じビルドが実行されます。成果物は各workflow runのArtifactsから取得できます。
+GitHubへpush後、「Actions > Build applications > Run workflow」で両OSの配布物を作れます。手動実行の成果物は各workflow runのArtifactsから取得できます。
+
+`v3.0.0` のようなタグをpushすると3環境のビルド後にGitHub Releaseも自動作成され、次のファイルが添付されます。ビルドが1つでも失敗した場合はReleaseを作成しません。
+
+- `KindleCapture-Windows.zip`
+- `KindleCapture-macOS-arm64.zip`
+- `KindleCapture-macOS-x86_64.zip`
 
 ## 開発・テスト
 
