@@ -1,6 +1,5 @@
 # Kindle Capture for Windows / macOS
-
-[masoniana/kindle-capture-windows](https://github.com/masoniana/kindle-capture-windows) を、WindowsとmacOSの両方で動く単一のPythonプロジェクトとして再構成したものです。Kindleのページを自動送りしながら連番JPEGを保存し、透明OCRテキスト付きPDFを作成します。
+Kindleのページを自動送りしながら連番JPEGを保存し、透明OCRテキスト付きPDFを作成します。
 
 Version 3.0.0でWindows専用構成からWindows/macOS共通構成へ移行しました。
 
