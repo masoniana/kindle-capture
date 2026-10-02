@@ -60,10 +60,10 @@ def _unique_output_directory(root: Path) -> tuple[Path, str]:
     return candidate, stamp
 
 
-def _save_jpeg(image: Image.Image, path: Path, quality: int) -> None:
+def _save_png(image: Image.Image, path: Path) -> None:
     temporary = path.with_name(path.name + ".partial")
     temporary.unlink(missing_ok=True)
-    image.convert("RGB").save(temporary, "JPEG", quality=quality, optimize=False, subsampling=0)
+    image.convert("RGB").save(temporary, "PNG", compress_level=3, optimize=False)
     if path.exists():
         temporary.unlink(missing_ok=True)
         raise FileExistsError(f"出力画像が既に存在します: {path}")
@@ -71,7 +71,7 @@ def _save_jpeg(image: Image.Image, path: Path, quality: int) -> None:
 
 
 def list_capture_images(folder: Path) -> list[Path]:
-    pattern = re.compile(r"^page_(\d+)\.(?:jpg|jpeg|png)$", re.IGNORECASE)
+    pattern = re.compile(r"^page_(\d+)\.(?:png|jpg|jpeg)$", re.IGNORECASE)
     numbered: list[tuple[int, Path]] = []
     for path in Path(folder).iterdir():
         if path.is_file() and (match := pattern.match(path.name)):
@@ -235,6 +235,7 @@ class CaptureEngine:
         manifest_path = output_directory / "capture-session.json"
         session: dict[str, object] = {
             "tool_version": __version__,
+            "image_format": "PNG",
             "started_at": _timestamp(),
             "updated_at": _timestamp(),
             "status": "Capturing",
@@ -301,8 +302,8 @@ class CaptureEngine:
                     else:
                         duplicate_count = 0
                         page_number = len(image_paths) + 1
-                        path = output_directory / f"page_{page_number:05d}.jpg"
-                        _save_jpeg(image, path, profile.jpeg_quality)
+                        path = output_directory / f"page_{page_number:05d}.png"
+                        _save_png(image, path)
                         image_paths.append(path)
                         previous_signature = current_signature
                         self.log(f"保存: {path.name}（差分 {difference:.1f}）")
@@ -414,7 +415,7 @@ def rebuild_pdf(
     folder = folder.expanduser().resolve()
     images = list_capture_images(folder)
     if not images:
-        raise ValueError("選択したフォルダに page_*.jpg / jpeg / png がありません。")
+        raise ValueError("選択したフォルダに page_*.png がありません（旧版の jpg / jpeg も読み込めます）。")
     ocr = None
     if ocr_enabled:
         try:

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import json
 from pathlib import Path
 
 from PIL import Image, ImageDraw
 from pypdf import PdfReader
 
-from kindle_capture.engine import CaptureEngine
+from kindle_capture.engine import CaptureEngine, rebuild_pdf
 from kindle_capture.models import CaptureRegion, CaptureSettings, WindowInfo
 
 
@@ -63,10 +64,39 @@ def test_engine_captures_pages_and_builds_pdf(tmp_path: Path) -> None:
         ocr_enabled=False,
         open_output=False,
     )
-    result = CaptureEngine(FakeController(), log=lambda _message: None, countdown_seconds=0).run(
+    controller = FakeController()
+    result = CaptureEngine(controller, log=lambda _message: None, countdown_seconds=0).run(
         window, CaptureRegion(), settings
     )
     assert len(result.image_paths) == 3
     assert result.pdf_path is not None and result.pdf_path.exists()
-    assert len(PdfReader(result.pdf_path).pages) == 3
-    assert (result.output_directory / "capture-session.json").exists()
+    reader = PdfReader(result.pdf_path)
+    assert len(reader.pages) == 3
+    for index, path in enumerate(result.image_paths):
+        assert path.name == f"page_{index + 1:05d}.png"
+        with Image.open(path) as image:
+            assert image.format == "PNG"
+            assert image.tobytes() == controller.pages[index].tobytes()
+            embedded = reader.pages[index]["/Resources"]["/XObject"]["/Im0"]
+            assert embedded["/Filter"] == "/FlateDecode"
+            assert embedded.get_data() == image.tobytes()
+    assert not list(result.output_directory.glob("*.jpg"))
+    manifest = json.loads((result.output_directory / "capture-session.json").read_text(encoding="utf-8"))
+    assert manifest["image_format"] == "PNG"
+
+
+def test_rebuild_orders_png_pages_and_supports_old_jpeg(tmp_path: Path) -> None:
+    images = [make_page(index) for index in range(3)]
+    images[0].save(tmp_path / "page_00001.png", "PNG")
+    images[1].save(tmp_path / "page_00002.jpg", "JPEG")
+    images[2].save(tmp_path / "page_00010.PNG", "PNG")
+    output = rebuild_pdf(tmp_path, ocr_enabled=False, log=lambda _message: None)
+    pages = PdfReader(output).pages
+    assert len(pages) == 3
+    for index in (0, 2):
+        embedded = pages[index]["/Resources"]["/XObject"]["/Im0"]
+        assert embedded["/Filter"] == "/FlateDecode"
+        assert embedded.get_data() == images[index].tobytes()
+    legacy = pages[1]["/Resources"]["/XObject"]["/Im0"]
+    assert legacy["/Filter"] == "/DCTDecode"
+    assert legacy.get_data() == (tmp_path / "page_00002.jpg").read_bytes()

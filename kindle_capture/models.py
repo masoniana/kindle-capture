@@ -57,14 +57,13 @@ class CaptureRegion:
 class SpeedProfile:
     poll_interval_ms: int
     stable_samples: int
-    jpeg_quality: int
     default_render_settle_ms: int
 
 
 SPEED_PROFILES: dict[str, SpeedProfile] = {
-    "Turbo": SpeedProfile(45, 2, 89, 350),
-    "Balanced": SpeedProfile(75, 3, 92, 550),
-    "Safe": SpeedProfile(120, 4, 94, 900),
+    "Turbo": SpeedProfile(45, 2, 350),
+    "Balanced": SpeedProfile(75, 3, 550),
+    "Safe": SpeedProfile(120, 4, 900),
 }
 
 

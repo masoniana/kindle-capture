@@ -144,7 +144,7 @@ class CaptureApp:
         ttk.Label(main, text="Kindle Capture", font=("TkDefaultFont", 20, "bold")).pack(anchor="w")
         ttk.Label(
             main,
-            text="Kindleを自動でページ送りし、連番JPEGと検索可能なPDFを作成します。",
+            text="Kindleを自動でページ送りし、連番PNGと検索可能なPDFを作成します。",
         ).pack(anchor="w", pady=(2, 12))
 
         target = ttk.LabelFrame(main, text="対象", padding=10)
@@ -342,7 +342,7 @@ class CaptureApp:
         self.worker.start()
 
     def start_rebuild(self) -> None:
-        folder = filedialog.askdirectory(title="page_*.jpg があるフォルダを選択")
+        folder = filedialog.askdirectory(title="page_*.png があるフォルダを選択（旧版のJPEGも対応）")
         if not folder:
             return
         ocr_enabled = self.ocr_var.get()

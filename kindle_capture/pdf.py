@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import zlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -49,14 +50,21 @@ class _PdfWriter:
         )
 
 
-def _jpeg_bytes(path: Path, quality: int = 88) -> tuple[bytes, int, int]:
+def _pdf_image_data(path: Path) -> tuple[bytes, int, int, str]:
     with Image.open(path) as image:
         width, height = image.size
-        if path.suffix.lower() in (".jpg", ".jpeg") and image.mode == "RGB":
-            return path.read_bytes(), width, height
-        buffer = io.BytesIO()
-        image.convert("RGB").save(buffer, "JPEG", quality=quality, optimize=False)
-        return buffer.getvalue(), width, height
+        # Keep old RGB JPEG captures usable without an additional encode.
+        if image.format == "JPEG" and image.mode == "RGB":
+            return path.read_bytes(), width, height, "DCTDecode"
+        # Screenshots are RGB PNGs: preserve every pixel without resizing or
+        # quantization. FlateDecode is PDF's lossless zlib compression filter.
+        if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+            rgba = image.convert("RGBA")
+            rgb = Image.new("RGB", image.size, "white")
+            rgb.paste(rgba, mask=rgba.getchannel("A"))
+        else:
+            rgb = image.convert("RGB")
+        return zlib.compress(rgb.tobytes()), width, height, "FlateDecode"
 
 
 def _unicode_hex(text: str) -> str:
@@ -151,7 +159,7 @@ def build_pdf(
             for index, image_path in enumerate(paths):
                 if should_cancel():
                     raise PdfBuildCancelled("PDF作成を停止しました。キャプチャ画像は残っています。")
-                jpeg, image_width, image_height = _jpeg_bytes(image_path)
+                image_data, image_width, image_height, image_filter = _pdf_image_data(image_path)
                 ocr_lines: list[OcrLine] = []
                 if ocr is not None:
                     try:
@@ -180,9 +188,9 @@ def build_pdf(
                 writer.start_object(image_object)
                 writer.ascii(
                     f"<< /Type /XObject /Subtype /Image /Width {image_width} /Height {image_height} "
-                    f"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {len(jpeg)} >>\nstream\n"
+                    f"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /{image_filter} /Length {len(image_data)} >>\nstream\n"
                 )
-                stream.write(jpeg)
+                stream.write(image_data)
                 writer.ascii("\nendstream\nendobj\n")
 
                 writer.start_object(content_object)
