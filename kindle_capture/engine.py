@@ -10,9 +10,10 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 import numpy as np
 from PIL import Image
@@ -68,6 +69,40 @@ def _save_png(image: Image.Image, path: Path) -> None:
         temporary.unlink(missing_ok=True)
         raise FileExistsError(f"出力画像が既に存在します: {path}")
     os.replace(temporary, path)
+
+
+_Writer = TypeVar("_Writer", bound="_PngWriter")
+
+
+class _PngWriter:
+    """One pending snapshot: overlap encoding with rendering, never grow a queue."""
+
+    def __init__(self, on_saved: Callable[[Path, float], None]) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="PNG writer")
+        self._pending: tuple[Future[None], Path, float] | None = None
+        self._on_saved = on_saved
+
+    def __enter__(self: _Writer) -> _Writer:  # noqa: PYI019 - Keep Python 3.10 support without an extra dependency.
+        return self
+
+    def submit(self, image: Image.Image, path: Path, difference: float) -> None:
+        self.finish()
+        # Freeze the pixels before sending another page-turn key.
+        future = self._executor.submit(_save_png, image.copy(), path)
+        self._pending = future, path, difference
+
+    def finish(self) -> None:
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            future, path, difference = pending
+            future.result()  # Disk/encoding errors must reach the capture thread.
+            self._on_saved(path, difference)
+
+    def __exit__(self, _kind: object, _value: object, _traceback: object) -> None:
+        try:
+            self.finish()  # Stop/error paths still drain the already captured page.
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 def list_capture_images(folder: Path) -> list[Path]:
@@ -264,8 +299,16 @@ class CaptureEngine:
         pdf_path: Path | None = None
         stopped = False
 
+        def on_saved(path: Path, difference: float) -> None:
+            image_paths.append(path)
+            self.log(f"保存: {path.name}（差分 {difference:.1f}）")
+            session["saved_pages"] = len(image_paths)
+            session["updated_at"] = _timestamp()
+            if len(image_paths) == 1 or len(image_paths) % 10 == 0:
+                _atomic_json(manifest_path, session)
+
         try:
-            with self.controller.prevent_sleep():
+            with self.controller.prevent_sleep(), _PngWriter(on_saved) as pngs:
                 self.controller.activate(window, click_page=True, region=region)
                 for remaining in range(self.countdown_seconds, 0, -1):
                     self.log(f"{remaining}秒後に開始します…")
@@ -277,15 +320,22 @@ class CaptureEngine:
                 duplicate_count = 0
                 started = time.monotonic()
                 profile = settings.speed
+                ready_capture: tuple[Image.Image, np.ndarray] | None = None
 
                 while not stopped and (settings.max_pages == 0 or len(image_paths) < settings.max_pages):
+                    # Usually already complete after the page's drawing wait.
+                    pngs.finish()
                     if self._should_stop():
                         stopped = True
                         self.log("停止要求を受け付けました。保存済み画像からPDFを作成します。")
                         break
                     self.controller.activate(window)
-                    image = self.controller.capture_region(window, region)
-                    current_signature = image_signature(image)
+                    if ready_capture is None:
+                        image = self.controller.capture_region(window, region)
+                        current_signature = image_signature(image)
+                    else:
+                        image, current_signature = ready_capture
+                        ready_capture = None
                     difference = (
                         float("inf")
                         if previous_signature is None
@@ -303,28 +353,30 @@ class CaptureEngine:
                         duplicate_count = 0
                         page_number = len(image_paths) + 1
                         path = output_directory / f"page_{page_number:05d}.png"
-                        _save_png(image, path)
-                        image_paths.append(path)
+                        pngs.submit(image, path, difference)
                         previous_signature = current_signature
-                        self.log(f"保存: {path.name}（差分 {difference:.1f}）")
-                        session["saved_pages"] = len(image_paths)
-                        session["updated_at"] = _timestamp()
-                        if page_number == 1 or page_number % 10 == 0:
-                            _atomic_json(manifest_path, session)
                         if page_number == 1:
                             mean, contrast = signature_statistics(current_signature)
                             self.log(f"初回画像チェック: 明るさ {mean:.1f}, コントラスト {contrast:.1f}")
                             if contrast < 3.0 or mean < 3.0 or mean > 252.0:
                                 self.log("警告: 最初の画像がほぼ単色です。選択範囲を確認してください。")
 
-                    if settings.max_pages > 0 and len(image_paths) >= settings.max_pages:
+                    captured_pages = len(image_paths) + (1 if difference >= settings.similarity_threshold else 0)
+                    if settings.max_pages > 0 and captured_pages >= settings.max_pages:
                         self.log("指定した保存ページ数に達しました。")
                         break
                     if previous_signature is None:
                         continue
                     self.controller.send_page_turn(window, direction)
+                    latest_image: Image.Image | None = None
+
+                    def capture_signature() -> np.ndarray:
+                        nonlocal latest_image
+                        latest_image = self.controller.capture_region(window, region)
+                        return image_signature(latest_image)
+
                     page_wait = wait_for_page_ready(
-                        lambda: self._signature(window, region),
+                        capture_signature,
                         previous_signature,
                         settings.maximum_wait_ms,
                         profile.poll_interval_ms,
@@ -338,6 +390,8 @@ class CaptureEngine:
                         self.log("停止要求を受け付けました。保存済み画像からPDFを作成します。")
                         break
                     if page_wait.changed and not page_wait.timed_out:
+                        if latest_image is not None and not page_wait.clarity_timed_out:
+                            ready_capture = latest_image, np.asarray(page_wait.signature)
                         self.log(
                             f"描画完了 {page_wait.elapsed_ms} ms "
                             f"(鮮明度待ち {page_wait.clarity_ms} ms, sharpness {page_wait.sharpness:.2f})"
@@ -345,6 +399,7 @@ class CaptureEngine:
                         if page_wait.clarity_timed_out:
                             self.log("警告: 鮮明度確認が上限に達しました。ぼやける場合は高解像度待ちを増やしてください。")
 
+                pngs.finish()
                 elapsed = time.monotonic() - started
                 self.log(f"キャプチャ完了: {len(image_paths)}ページ、{elapsed:.1f}秒")
 

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import os
+import struct
 import zlib
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,12 +52,50 @@ class _PdfWriter:
         )
 
 
-def _pdf_image_data(path: Path) -> tuple[bytes, int, int, str]:
+def _png_compressed_data(path: Path) -> bytes | None:
+    """Reuse only ordinary 8-bit RGB PNG scanlines; all other layouts fall back."""
+    data = path.read_bytes()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    offset = 8
+    chunks: list[bytes] = []
+    while offset + 12 <= len(data):
+        length = struct.unpack_from(">I", data, offset)[0]
+        chunk_type = data[offset + 4:offset + 8]
+        end = offset + 8 + length
+        if end + 4 > len(data):
+            raise ValueError(f"PNGが途中で切れています: {path.name}")
+        payload = data[offset + 8:end]
+        checksum = struct.unpack_from(">I", data, end)[0]
+        if zlib.crc32(data[offset + 4:end]) & 0xFFFFFFFF != checksum:
+            raise ValueError(f"PNGの整合性チェックに失敗しました: {path.name}")
+        if offset == 8:
+            if chunk_type != b"IHDR" or length != 13 or payload[8:] != b"\x08\x02\x00\x00\x00":
+                return None
+        elif chunk_type in (b"tRNS", b"acTL"):
+            return None
+        elif chunk_type == b"IDAT":
+            chunks.append(payload)
+        elif chunk_type == b"IEND":
+            if length != 0 or not chunks:
+                raise ValueError(f"PNGの画像データがありません: {path.name}")
+            return b"".join(chunks)
+        offset = end + 4
+    raise ValueError(f"PNGの終端がありません: {path.name}")
+
+
+def _pdf_image_data(path: Path) -> tuple[bytes, int, int, str, str]:
     with Image.open(path) as image:
         width, height = image.size
         # Keep old RGB JPEG captures usable without an additional encode.
         if image.format == "JPEG" and image.mode == "RGB":
-            return path.read_bytes(), width, height, "DCTDecode"
+            return path.read_bytes(), width, height, "DCTDecode", ""
+        if image.format == "PNG" and image.mode == "RGB":
+            compressed = _png_compressed_data(path)
+            if compressed is not None:
+                # PDF's PNG predictor undoes the existing per-row PNG filters.
+                parameters = f" /DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns {width} >>"
+                return compressed, width, height, "FlateDecode", parameters
         # Screenshots are RGB PNGs: preserve every pixel without resizing or
         # quantization. FlateDecode is PDF's lossless zlib compression filter.
         if image.mode in ("RGBA", "LA") or "transparency" in image.info:
@@ -64,7 +104,7 @@ def _pdf_image_data(path: Path) -> tuple[bytes, int, int, str]:
             rgb.paste(rgba, mask=rgba.getchannel("A"))
         else:
             rgb = image.convert("RGB")
-        return zlib.compress(rgb.tobytes()), width, height, "FlateDecode"
+        return zlib.compress(rgb.tobytes()), width, height, "FlateDecode", ""
 
 
 def _unicode_hex(text: str) -> str:
@@ -142,7 +182,7 @@ def build_pdf(
     ocr_line_count = 0
 
     try:
-        with partial.open("xb") as stream:
+        with partial.open("xb") as stream, ThreadPoolExecutor(max_workers=1, thread_name_prefix="PDF image") as images:
             writer = _PdfWriter(stream, object_count)
             writer.ascii("%PDF-1.4\n")
             stream.write(b"%\xE2\xE3\xCF\xD3\n")
@@ -156,10 +196,15 @@ def build_pdf(
             writer.start_object(2)
             writer.ascii(f"<< /Type /Pages /Count {len(paths)} /Kids [{page_refs}] >>\nendobj\n")
 
+            # One-page lookahead overlaps image preparation with OCR, but keeps
+            # native OCR on its original thread and bounds memory usage.
+            prepared_image = images.submit(_pdf_image_data, paths[0])
             for index, image_path in enumerate(paths):
                 if should_cancel():
                     raise PdfBuildCancelled("PDF作成を停止しました。キャプチャ画像は残っています。")
-                image_data, image_width, image_height, image_filter = _pdf_image_data(image_path)
+                image_data, image_width, image_height, image_filter, parameters = prepared_image.result()
+                if index + 1 < len(paths):
+                    prepared_image = images.submit(_pdf_image_data, paths[index + 1])
                 ocr_lines: list[OcrLine] = []
                 if ocr is not None:
                     try:
@@ -188,7 +233,7 @@ def build_pdf(
                 writer.start_object(image_object)
                 writer.ascii(
                     f"<< /Type /XObject /Subtype /Image /Width {image_width} /Height {image_height} "
-                    f"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /{image_filter} /Length {len(image_data)} >>\nstream\n"
+                    f"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /{image_filter}{parameters} /Length {len(image_data)} >>\nstream\n"
                 )
                 stream.write(image_data)
                 writer.ascii("\nendstream\nendobj\n")
