@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from PIL import Image
 
 from .models import CaptureRegion, WindowInfo
+from .selection import ScreenRectangle, SelectionTargets
 
 
 class MacPermissionError(RuntimeError):
@@ -133,6 +134,108 @@ class MacOSController:
                 self._post_mouse(self.Quartz.kCGEventLeftMouseDown, point)
                 self._post_mouse(self.Quartz.kCGEventLeftMouseUp, point)
                 time.sleep(0.25)
+
+    def _ax_attribute(self, element: object, name: str) -> object | None:
+        error, value = self.ApplicationServices.AXUIElementCopyAttributeValue(element, name, None)
+        return value if error == 0 else None
+
+    def _ax_rectangle(self, element: object) -> ScreenRectangle | None:
+        ax = self.ApplicationServices
+        position = self._ax_attribute(element, "AXPosition")
+        size = self._ax_attribute(element, "AXSize")
+        if position is None or size is None:
+            return None
+        position_ok, point = ax.AXValueGetValue(position, ax.kAXValueCGPointType, None)
+        size_ok, dimensions = ax.AXValueGetValue(size, ax.kAXValueCGSizeType, None)
+        if not position_ok or not size_ok:
+            return None
+        rect = ScreenRectangle(float(point[0]), float(point[1]), float(dimensions[0]), float(dimensions[1]))
+        return rect if rect.valid else None
+
+    def _ax_window(self, window: WindowInfo) -> object | None:
+        ax = self.ApplicationServices
+        app = ax.AXUIElementCreateApplication(window.process_id)
+        ax.AXUIElementSetMessagingTimeout(app, 0.15)
+        bounds = ScreenRectangle.from_window(window)
+        matches = []
+        for element in self._ax_attribute(app, "AXWindows") or ():
+            rect = self._ax_rectangle(element)
+            if rect is not None and all(abs(a - b) <= 4 for a, b in zip(
+                (rect.x, rect.y, rect.width, rect.height),
+                (bounds.x, bounds.y, bounds.width, bounds.height),
+            )):
+                if self._ax_attribute(element, "AXTitle") == window.title:
+                    return element
+                matches.append(element)
+        return matches[0] if len(matches) == 1 else None
+
+    def _standard_client_rectangle(self, window: WindowInfo) -> ScreenRectangle:
+        bounds = ScreenRectangle.from_window(window)
+        # Full-screen windows have no title-bar inset. NSScreen is in bottom-up
+        # Cocoa coordinates; CGWindow/AX coordinates start at the primary top.
+        screens = self.AppKit.NSScreen.screens()
+        if screens:
+            primary_height = screens[0].frame().size.height
+            for screen in screens:
+                frame = screen.frame()
+                display = ScreenRectangle(
+                    frame.origin.x, primary_height - frame.origin.y - frame.size.height,
+                    frame.size.width, frame.size.height,
+                )
+                if all(abs(a - b) <= 2 for a, b in zip(
+                    (bounds.x, bounds.y, bounds.width, bounds.height),
+                    (display.x, display.y, display.width, display.height),
+                )):
+                    return bounds
+        frame = self.AppKit.NSMakeRect(0, 0, bounds.width, bounds.height)
+        content = self.AppKit.NSWindow.contentRectForFrameRect_styleMask_(
+            frame, self.AppKit.NSWindowStyleMaskTitled,
+        )
+        return ScreenRectangle(
+            bounds.x + content.origin.x,
+            bounds.y + bounds.height - content.origin.y - content.size.height,
+            content.size.width, content.size.height,
+        )
+
+    def selection_targets(self, window: WindowInfo) -> SelectionTargets:
+        current = self.current_window(window)
+        bounds = ScreenRectangle.from_window(current)
+        client = self._standard_client_rectangle(current)
+        candidates: list[ScreenRectangle] = []
+        with self.objc.autorelease_pool():
+            try:
+                element = self._ax_window(current)
+                if element is not None:
+                    if self._ax_attribute(element, "AXFullScreen"):
+                        client = bounds
+                    # Prefer the content bounds exposed by the target app.
+                    contents = self._ax_attribute(element, "AXContents") or ()
+                    content_rects = [self._ax_rectangle(child) for child in contents]
+                    content_rects = [rect for rect in content_rects if rect is not None]
+                    if content_rects:
+                        left = min(rect.x for rect in content_rects)
+                        top = min(rect.y for rect in content_rects)
+                        right = max(rect.x + rect.width for rect in content_rects)
+                        bottom = max(rect.y + rect.height for rect in content_rects)
+                        client = ScreenRectangle(left, top, right - left, bottom - top).intersection(bounds) or client
+                    roles = {"AXGroup", "AXScrollArea", "AXSplitGroup", "AXWebArea", "AXLayoutArea", "AXTextArea", "AXImage", "AXUnknown"}
+                    pending = [(child, 0) for child in self._ax_attribute(element, "AXChildren") or ()]
+                    visited = 0
+                    deadline = time.monotonic() + 1.5
+                    while pending and visited < 512 and time.monotonic() < deadline:
+                        child, depth = pending.pop()
+                        visited += 1
+                        if self._ax_attribute(child, "AXRole") in roles:
+                            rect = self._ax_rectangle(child)
+                            if rect is not None:
+                                candidates.append(rect)
+                        if depth < 12:
+                            pending.extend((descendant, depth + 1) for descendant in self._ax_attribute(child, "AXChildren") or ())
+            except Exception:
+                # Some Kindle versions expose no AX reading panes. Keep the
+                # independently computed client fallback available to click.
+                candidates = []
+        return SelectionTargets(client, candidates)
 
     def _post_mouse(self, event_type: int, point: object) -> None:
         q = self.Quartz

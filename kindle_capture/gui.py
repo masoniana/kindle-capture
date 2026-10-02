@@ -13,81 +13,95 @@ from PIL import Image, ImageTk
 from .controllers import create_controller, platform_label
 from .engine import CaptureEngine, rebuild_pdf
 from .models import SPEED_PROFILES, CaptureRegion, CaptureSettings, WindowInfo
+from .selection import ScreenRectangle, SelectionTargets
 
 
 class RegionDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Misc, image: Image.Image) -> None:
+    def __init__(self, parent: tk.Misc, image: Image.Image, window: WindowInfo, targets: SelectionTargets) -> None:
         super().__init__(parent)
-        self.title("キャプチャ範囲をドラッグして選択")
-        self.transient(parent)
-        self.grab_set()
-        self.original_size = image.size
-        preview = image.copy()
-        preview.thumbnail((1100, 720), Image.Resampling.LANCZOS)
-        self.preview_size = preview.size
-        self.photo = ImageTk.PhotoImage(preview)
+        self.withdraw()
+        self.title("Kindle本文にカーソルを合わせて1回クリック — Escでキャンセル")
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.window = window
+        self.targets = targets
+        self.candidate = targets.client
+        self.display_width = max(1, round(window.width))
+        self.display_height = max(1, round(window.height))
+        self.geometry(f"{self.display_width}x{self.display_height}+{round(window.x)}+{round(window.y)}")
+        # Cover Kindle at its real screen position. On Retina displays the CG
+        # image has more pixels than screen points, so scale it to the overlay.
+        self.photo = ImageTk.PhotoImage(image.resize(
+            (self.display_width, self.display_height), Image.Resampling.LANCZOS,
+        ), master=self)
         self.result: CaptureRegion | None = None
-        self.start: tuple[int, int] | None = None
-        self.rectangle: int | None = None
-
-        ttk.Label(
-            self,
-            text="本文だけを囲むようにドラッグしてください。確定後もウィンドウサイズに追従します。",
-            padding=(12, 10),
-        ).pack(fill="x")
         self.canvas = tk.Canvas(
-            self,
-            width=preview.width,
-            height=preview.height,
-            highlightthickness=0,
-            cursor="crosshair",
+            self, width=self.display_width, height=self.display_height,
+            highlightthickness=0, borderwidth=0, cursor="hand2",
         )
-        self.canvas.pack(padx=12)
+        self.canvas.pack(fill="both", expand=True)
         self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
-        self.canvas.bind("<ButtonPress-1>", self._press)
-        self.canvas.bind("<B1-Motion>", self._drag)
-        self.canvas.bind("<ButtonRelease-1>", self._release)
-
-        buttons = ttk.Frame(self, padding=12)
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="キャンセル", command=self.destroy).pack(side="right")
-        self.use_button = ttk.Button(buttons, text="この範囲を使う", command=self._accept, state="disabled")
-        self.use_button.pack(side="right", padx=(0, 8))
+        self.rectangle = self.canvas.create_rectangle(0, 0, 1, 1, outline="#00e676", width=4)
+        self.hint_background = self.canvas.create_rectangle(8, 8, 1, 1, fill="#163528", outline="")
+        self.hint = self.canvas.create_text(
+            16, 14, anchor="nw", fill="white", width=max(100, self.display_width - 32),
+            font=("TkDefaultFont", 11),
+        )
+        self.canvas.bind("<Motion>", self._hover)
+        self.canvas.bind("<ButtonPress-1>", self._accept)
+        self.canvas.bind("<ButtonPress-3>", lambda _event: self.destroy())
         self.bind("<Escape>", lambda _event: self.destroy())
         self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self._draw_candidate()
+        self.deiconify()
+        self.update_idletasks()
+        self.lift()
+        self.focus_force()
+        self.grab_set()
+        self.after_idle(self._initial_pointer)
 
-    def _clamp(self, x: int, y: int) -> tuple[int, int]:
-        return max(0, min(self.preview_size[0], x)), max(0, min(self.preview_size[1], y))
+    def _initial_pointer(self) -> None:
+        if self.winfo_exists():
+            self._select_at(self.winfo_pointerx(), self.winfo_pointery())
 
-    def _press(self, event: tk.Event) -> None:
-        self.start = self._clamp(event.x, event.y)
-        if self.rectangle is not None:
-            self.canvas.delete(self.rectangle)
-        self.rectangle = self.canvas.create_rectangle(
-            self.start[0], self.start[1], self.start[0], self.start[1], outline="#28d17c", width=3
+    def _select_at(self, x: float, y: float) -> None:
+        self.candidate = self.targets.at(x, y)
+        self._draw_candidate()
+
+    def _draw_candidate(self) -> None:
+        rect = self.candidate
+        x_scale = self.display_width / self.window.width
+        y_scale = self.display_height / self.window.height
+        self.canvas.coords(
+            self.rectangle,
+            (rect.x - self.window.x) * x_scale + 2,
+            (rect.y - self.window.y) * y_scale + 2,
+            (rect.x + rect.width - self.window.x) * x_scale - 2,
+            (rect.y + rect.height - self.window.y) * y_scale - 2,
         )
-        self.use_button.configure(state="disabled")
+        mode = "クライアント領域（自動フォールバック）" if rect == self.targets.client else "本文の画面境界を自動検出"
+        self.canvas.itemconfigure(self.hint, text=f"本文にカーソルを合わせて1回クリックで確定 / Escでキャンセル\n{mode}")
+        hint_bounds = self.canvas.bbox(self.hint)
+        if hint_bounds is not None:
+            self.canvas.coords(self.hint_background, hint_bounds[0] - 8, hint_bounds[1] - 6, hint_bounds[2] + 8, hint_bounds[3] + 6)
 
-    def _drag(self, event: tk.Event) -> None:
-        if self.start is None or self.rectangle is None:
+    def _event_point(self, event: tk.Event) -> tuple[float, float]:
+        return (
+            self.window.x + event.x * self.window.width / self.display_width,
+            self.window.y + event.y * self.window.height / self.display_height,
+        )
+
+    def _hover(self, event: tk.Event) -> None:
+        self._select_at(*self._event_point(event))
+
+    def _accept(self, event: tk.Event) -> None:
+        # Re-evaluate at the click, even if no preceding Motion was delivered.
+        x, y = self._event_point(event)
+        if not self.targets.client.contains(x, y):
             return
-        x, y = self._clamp(event.x, event.y)
-        self.canvas.coords(self.rectangle, self.start[0], self.start[1], x, y)
-
-    def _release(self, event: tk.Event) -> None:
-        if self.start is None or self.rectangle is None:
-            return
-        x, y = self._clamp(event.x, event.y)
-        left, right = sorted((self.start[0], x))
-        top, bottom = sorted((self.start[1], y))
-        if right - left >= 40 and bottom - top >= 40:
-            width, height = self.preview_size
-            self.result = CaptureRegion(left / width, top / height, (right - left) / width, (bottom - top) / height)
-            self.use_button.configure(state="normal")
-
-    def _accept(self) -> None:
-        if self.result is not None:
-            self.destroy()
+        self._select_at(x, y)
+        self.result = self.candidate.relative_to(self.window)
+        self.destroy()
 
 
 class CaptureApp:
@@ -108,7 +122,7 @@ class CaptureApp:
         self.output_var = tk.StringVar(value=str(Path.home() / "Documents" / "KindleCapture"))
         self.pages_var = tk.StringVar(value="1500")
         self.direction_var = tk.StringVar(value="Auto")
-        self.area_var = tk.StringVar(value="選択範囲")
+        self.area_var = tk.StringVar(value="カーソル自動指定")
         self.speed_var = tk.StringVar(value="Turbo")
         self.settle_var = tk.StringVar(value="350")
         self.wait_var = tk.StringVar(value="1500")
@@ -159,10 +173,10 @@ class CaptureApp:
         self._field(settings, 3, 0, "類似判定", ttk.Entry(settings, textvariable=self.similarity_var, width=12))
 
         ttk.Label(settings, text="キャプチャ範囲").grid(row=4, column=0, sticky="w", pady=(9, 0))
-        area_combo = ttk.Combobox(settings, textvariable=self.area_var, values=("選択範囲", "ウィンドウ全体"), state="readonly", width=14)
+        area_combo = ttk.Combobox(settings, textvariable=self.area_var, values=("カーソル自動指定", "ウィンドウ全体"), state="readonly", width=14)
         area_combo.grid(row=4, column=1, sticky="w", pady=(9, 0))
         area_combo.bind("<<ComboboxSelected>>", self._area_changed)
-        self.select_button = ttk.Button(settings, text="範囲を選択…", command=self.select_region)
+        self.select_button = ttk.Button(settings, text="画面部分を自動指定", command=self.select_region)
         self.select_button.grid(row=4, column=2, sticky="w", pady=(9, 0))
         ttk.Label(settings, textvariable=self.region_var).grid(row=4, column=3, sticky="w", pady=(9, 0))
 
@@ -239,18 +253,39 @@ class CaptureApp:
             raise ValueError("対象のKindleウィンドウを選択してください。")
         return self.windows[index]
 
-    def select_region(self) -> None:
+    def select_region(self) -> bool:
+        if self.worker is not None and self.worker.is_alive():
+            return False
+        hidden = False
         try:
             window = self._selected_window()
             self.controller.ensure_permissions(request=True)
+            self.root.withdraw()
+            hidden = True
+            self.controller.activate(window)
+            window = self.controller.current_window(window)
+            targets = self.controller.selection_targets(window)
             image = self.controller.capture_window(window)
-            dialog = RegionDialog(self.root, image)
+            dialog = RegionDialog(self.root, image, window, targets)
             self.root.wait_window(dialog)
             if dialog.result is not None:
+                current = self.controller.current_window(window)
+                if ScreenRectangle.from_window(current) != ScreenRectangle.from_window(window):
+                    raise ValueError("Kindleの位置またはサイズが変わりました。もう一度自動指定してください。")
                 self.region = dialog.result
                 self.region_var.set("指定済み")
+                return True
+            return False
         except Exception as error:
+            if hidden:
+                self.root.deiconify()
+                hidden = False
             messagebox.showerror("範囲を選択できません", str(error))
+            return False
+        finally:
+            if hidden:
+                self.root.deiconify()
+                self.root.lift()
 
     def _settings(self) -> CaptureSettings:
         return CaptureSettings(
@@ -285,7 +320,9 @@ class CaptureApp:
             elif self.region is not None:
                 region = self.region
             else:
-                raise ValueError("「範囲を選択…」でKindle本文を指定してください。")
+                if not self.select_region():
+                    return
+                region = self.region
         except Exception as error:
             messagebox.showwarning("設定を確認してください", str(error))
             return

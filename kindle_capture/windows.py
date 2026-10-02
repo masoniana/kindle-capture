@@ -11,6 +11,7 @@ from pathlib import Path
 from PIL import Image, ImageGrab
 
 from .models import CaptureRegion, WindowInfo
+from .selection import ScreenRectangle, SelectionTargets
 
 
 class RECT(ctypes.Structure):
@@ -80,6 +81,10 @@ class WindowsController:
         self.WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         self.user32.EnumWindows.argtypes = [self.WNDENUMPROC, wintypes.LPARAM]
         self.user32.EnumWindows.restype = wintypes.BOOL
+        self.user32.EnumChildWindows.argtypes = [wintypes.HWND, self.WNDENUMPROC, wintypes.LPARAM]
+        self.user32.EnumChildWindows.restype = wintypes.BOOL
+        self.user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+        self.user32.GetWindowRect.restype = wintypes.BOOL
         self.user32.IsWindow.argtypes = [wintypes.HWND]
         self.user32.IsWindow.restype = wintypes.BOOL
         self.user32.IsWindowVisible.argtypes = [wintypes.HWND]
@@ -234,6 +239,26 @@ class WindowsController:
 
     def ensure_permissions(self, request: bool = True) -> None:
         return None
+
+    def selection_targets(self, window: WindowInfo) -> SelectionTargets:
+        current = self.current_window(window)
+        client = ScreenRectangle.from_window(current)
+        candidates: list[ScreenRectangle] = []
+
+        @self.WNDENUMPROC
+        def callback(handle: int, _parameter: int) -> bool:
+            if self.user32.IsWindowVisible(handle):
+                rect = RECT()
+                if self.user32.GetWindowRect(handle, ctypes.byref(rect)):
+                    candidates.append(ScreenRectangle(
+                        rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                    ))
+            return True
+
+        # EnumChildWindows walks descendants, including nested reading panes.
+        # A Kindle version without native child panes simply uses the client.
+        self.user32.EnumChildWindows(current.window_id, callback, 0)
+        return SelectionTargets(client, candidates)
 
     def activate(
         self,

@@ -1,3 +1,3 @@
 """Kindle Capture for Windows and macOS."""
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"

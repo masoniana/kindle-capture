@@ -17,6 +17,7 @@ from typing import Protocol
 import numpy as np
 from PIL import Image
 
+from . import __version__
 from .analysis import (
     compare_signatures,
     image_signature,
@@ -233,7 +234,7 @@ class CaptureEngine:
         output_directory, stamp = _unique_output_directory(root)
         manifest_path = output_directory / "capture-session.json"
         session: dict[str, object] = {
-            "tool_version": "3.0.0",
+            "tool_version": __version__,
             "started_at": _timestamp(),
             "updated_at": _timestamp(),
             "status": "Capturing",
